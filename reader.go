@@ -462,7 +462,7 @@ func (q *Reader) onConnectionClosed(c *Conn) {
 	c.Unlock()
 
 	q.Lock()
-	delete(q.connections, c.Address())
+	delete(q.connections, c.RemoteAddr().String())
 	left := len(q.connections)
 	q.Unlock()
 
