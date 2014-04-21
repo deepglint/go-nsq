@@ -53,7 +53,7 @@ type Reader struct {
 	totalRdyCount    int64
 	backoffDuration  int64
 
-	sync.RWMutex
+	mtx sync.RWMutex
 
 	id      int64
 	topic   string
@@ -67,7 +67,9 @@ type Reader struct {
 
 	incomingMessages chan *Message
 
-	rdyRetryTimers     map[string]*time.Timer
+	rdyRetryMtx    sync.RWMutex
+	rdyRetryTimers map[string]*time.Timer
+
 	pendingConnections map[string]bool
 	connections        map[string]*Conn
 
@@ -125,12 +127,12 @@ func NewReader(topic string, channel string, config *Config) (*Reader, error) {
 }
 
 func (q *Reader) conns() []*Conn {
-	q.RLock()
+	q.mtx.RLock()
 	conns := make([]*Conn, 0, len(q.connections))
 	for _, c := range q.connections {
 		conns = append(conns, c)
 	}
-	q.RUnlock()
+	q.mtx.RUnlock()
 	return conns
 }
 
@@ -141,17 +143,17 @@ func (q *Reader) conns() []*Conn {
 // is responsible for.
 func (q *Reader) ConnectionMaxInFlight() int64 {
 	b := float64(q.maxInFlight())
-	q.RLock()
+	q.mtx.RLock()
 	s := b / float64(len(q.connections))
-	q.RUnlock()
+	q.mtx.RUnlock()
 	return int64(math.Min(math.Max(1, s), b))
 }
 
 // IsStarved indicates whether any connections for this reader are blocked on processing
 // before being able to receive more messages (ie. RDY count of 0 and not exiting)
 func (q *Reader) IsStarved() bool {
-	q.RLock()
-	defer q.RUnlock()
+	q.mtx.RLock()
+	defer q.mtx.RUnlock()
 
 	for _, conn := range q.connections {
 		threshold := int64(float64(atomic.LoadInt64(&conn.lastRdyCount)) * 0.85)
@@ -196,16 +198,16 @@ func (q *Reader) maxInFlight() int {
 //
 // A goroutine is spawned to handle continual polling.
 func (q *Reader) ConnectToLookupd(addr string) error {
-	q.Lock()
+	q.mtx.Lock()
 	for _, x := range q.lookupdHTTPAddrs {
 		if x == addr {
-			q.Unlock()
+			q.mtx.Unlock()
 			return ErrLookupdAddressExists
 		}
 	}
 	q.lookupdHTTPAddrs = append(q.lookupdHTTPAddrs, addr)
 	numLookupd := len(q.lookupdHTTPAddrs)
-	q.Unlock()
+	q.mtx.Unlock()
 
 	// if this is the first one, kick off the go loop
 	if numLookupd == 1 {
@@ -256,10 +258,10 @@ exit:
 //
 // initiate a connection to any new producers that are identified.
 func (q *Reader) queryLookupd() {
-	q.RLock()
+	q.mtx.RLock()
 	addr := q.lookupdHTTPAddrs[q.lookupdQueryIndex]
 	num := len(q.lookupdHTTPAddrs)
-	q.RUnlock()
+	q.mtx.RUnlock()
 	q.lookupdQueryIndex = (q.lookupdQueryIndex + 1) % num
 	endpoint := fmt.Sprintf("http://%s/lookup?topic=%s", addr, url.QueryEscape(q.topic))
 
@@ -319,14 +321,14 @@ func (q *Reader) ConnectToNSQ(addr string) error {
 		return errors.New("no handlers")
 	}
 
-	q.RLock()
+	q.mtx.RLock()
 	_, ok := q.connections[addr]
 	_, pendingOk := q.pendingConnections[addr]
 	if ok || pendingOk {
-		q.RUnlock()
+		q.mtx.RUnlock()
 		return ErrAlreadyConnected
 	}
-	q.RUnlock()
+	q.mtx.RUnlock()
 
 	log.Printf("[%s] connecting to nsqd", addr)
 
@@ -334,9 +336,9 @@ func (q *Reader) ConnectToNSQ(addr string) error {
 	conn.Delegate = &readerConnDelegate{q}
 
 	cleanupConnection := func() {
-		q.Lock()
+		q.mtx.Lock()
 		delete(q.pendingConnections, addr)
-		q.Unlock()
+		q.mtx.Unlock()
 		conn.Close()
 	}
 
@@ -373,10 +375,10 @@ func (q *Reader) ConnectToNSQ(addr string) error {
 			conn, q.topic, q.channel, err.Error())
 	}
 
-	q.Lock()
+	q.mtx.Lock()
 	delete(q.pendingConnections, addr)
 	q.connections[addr] = conn
-	q.Unlock()
+	q.mtx.Unlock()
 
 	// pre-emptive signal to existing connections to lower their RDY count
 	for _, c := range q.conns() {
@@ -440,19 +442,19 @@ func (q *Reader) onConnClose(c *Conn) {
 	rdyCount := c.RDY()
 	atomic.AddInt64(&q.totalRdyCount, -rdyCount)
 
-	c.Lock()
+	q.rdyRetryMtx.Lock()
 	if timer, ok := q.rdyRetryTimers[c.String()]; ok {
 		// stop any pending retry of an old RDY update
 		timer.Stop()
 		delete(q.rdyRetryTimers, c.String())
 		hasRDYRetryTimer = true
 	}
-	c.Unlock()
+	q.rdyRetryMtx.Unlock()
 
-	q.Lock()
+	q.mtx.Lock()
 	delete(q.connections, c.RemoteAddr().String())
 	left := len(q.connections)
-	q.Unlock()
+	q.mtx.Unlock()
 
 	log.Printf("there are %d connections left alive", left)
 
@@ -472,9 +474,9 @@ func (q *Reader) onConnClose(c *Conn) {
 		return
 	}
 
-	q.RLock()
+	q.mtx.RLock()
 	numLookupd := len(q.lookupdHTTPAddrs)
-	q.RUnlock()
+	q.mtx.RUnlock()
 	if numLookupd != 0 && atomic.LoadInt32(&q.stopFlag) == 0 {
 		// trigger a poll of the lookupd
 		select {
@@ -535,7 +537,7 @@ func (q *Reader) rdyLoop() {
 			backoffTimerChan = nil
 			atomic.StoreInt64(&q.backoffDuration, 0)
 
-			q.RLock()
+			q.mtx.RLock()
 			// pick a random connection to test the waters
 			var i int
 			if len(q.connections) == 0 {
@@ -549,7 +551,7 @@ func (q *Reader) rdyLoop() {
 				}
 				i++
 			}
-			q.RUnlock()
+			q.mtx.RUnlock()
 
 			log.Printf("[%s] backoff time expired, continuing with RDY 1...", choice)
 			// while in backoff only ever let 1 message at a time through
@@ -661,12 +663,12 @@ func (q *Reader) updateRDY(c *Conn, count int64) error {
 	}
 
 	// stop any pending retry of an old RDY update
-	c.Lock()
+	q.rdyRetryMtx.Lock()
 	if timer, ok := q.rdyRetryTimers[c.String()]; ok {
 		timer.Stop()
 		delete(q.rdyRetryTimers, c.String())
 	}
-	c.Unlock()
+	q.rdyRetryMtx.Unlock()
 
 	// never exceed our global max in flight. truncate if possible.
 	// this could help a new connection get partial max-in-flight
@@ -680,12 +682,12 @@ func (q *Reader) updateRDY(c *Conn, count int64) error {
 			// we wanted to exit a zero RDY count but we couldn't send it...
 			// in order to prevent eternal starvation we reschedule this attempt
 			// (if any other RDY update succeeds this timer will be stopped)
-			c.Lock()
+			q.rdyRetryMtx.Lock()
 			q.rdyRetryTimers[c.String()] = time.AfterFunc(5*time.Second,
 				func() {
 					q.updateRDY(c, count)
 				})
-			c.Unlock()
+			q.rdyRetryMtx.Unlock()
 		}
 		return ErrOverMaxInFlight
 	}
@@ -714,9 +716,9 @@ func (q *Reader) redistributeRDY() {
 		return
 	}
 
-	q.RLock()
+	q.mtx.RLock()
 	numConns := len(q.connections)
-	q.RUnlock()
+	q.mtx.RUnlock()
 	maxInFlight := q.maxInFlight()
 	if numConns > maxInFlight {
 		log.Printf("redistributing RDY state (%d conns > %d max_in_flight)",
@@ -775,9 +777,9 @@ func (q *Reader) Stop() {
 
 	log.Printf("stopping reader")
 
-	q.RLock()
+	q.mtx.RLock()
 	l := len(q.connections)
-	q.RUnlock()
+	q.mtx.RUnlock()
 
 	if l == 0 {
 		q.stopHandlers()
