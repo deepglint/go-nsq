@@ -157,11 +157,11 @@ func (q *Reader) SetLogger(logger *log.Logger, lvl LogLevel) {
 	q.logLvl = lvl
 }
 
-// ConnectionMaxInFlight calculates the per-connection max-in-flight count.
+// perConnMaxInFlight calculates the per-connection max-in-flight count.
 //
 // This may change dynamically based on the number of connections to nsqd the Reader
 // is responsible for.
-func (q *Reader) ConnectionMaxInFlight() int64 {
+func (q *Reader) perConnMaxInFlight() int64 {
 	b := float64(q.maxInFlight())
 	q.mtx.RLock()
 	s := b / float64(len(q.connections))
@@ -185,23 +185,6 @@ func (q *Reader) IsStarved() bool {
 	return false
 }
 
-func (q *Reader) SetMaxInFlight(maxInFlight int) {
-	if atomic.LoadInt32(&q.stopFlag) == 1 {
-		return
-	}
-
-	q.maxInFlightMutex.Lock()
-	if maxInFlight == q.maxInFlight {
-		q.maxInFlightMutex.Unlock()
-		return
-	}
-	q.maxInFlight = maxInFlight
-	q.maxInFlightMutex.Unlock()
-
-	for _, c := range q.conns() {
-		q.rdyChan <- c
-	}
-}
 
 // MaxInFlight returns the configured maximum number of messages to allow in-flight.
 func (q *Reader) maxInFlight() int {
@@ -575,7 +558,7 @@ func (q *Reader) rdyLoop() {
 			// send ready immediately
 			remain := c.RDY()
 			lastRdyCount := c.LastRDY()
-			count := q.ConnectionMaxInFlight()
+			count := q.perConnMaxInFlight()
 			// refill when at 1, or at 25%, or if connections have changed and we have too many RDY
 			if remain <= 1 || remain < (lastRdyCount/4) || (count > 0 && count < remain) {
 				q.log(LogLevelDebug, "(%s) sending RDY %d (%d remain from last RDY %d)",
@@ -615,7 +598,7 @@ func (q *Reader) rdyLoop() {
 
 			// exit backoff
 			if backoffCounter == 0 && backoffUpdated {
-				count := q.ConnectionMaxInFlight()
+				count := q.perConnMaxInFlight()
 				q.log(LogLevelWarning, "exiting backoff, returning all to RDY %d", count)
 				for _, c := range q.conns() {
 					q.updateRDY(c, count)
