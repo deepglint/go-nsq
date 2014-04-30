@@ -5,4 +5,4 @@
 package nsq
 
 // VERSION
-const VERSION = "0.3.7-alpha"
+const VERSION = "0.4.0-alpha"
