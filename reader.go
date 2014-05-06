@@ -211,13 +211,13 @@ func (q *Reader) maxInFlight() int {
 	return mif
 }
 
-// ConnectToLookupd adds an nsqlookupd address to the list for this Reader instance.
+// ConnectToNSQLookupd adds an nsqlookupd address to the list for this Reader instance.
 //
 // If it is the first to be added, it initiates an HTTP request to discover nsqd
 // producers for the configured topic.
 //
 // A goroutine is spawned to handle continual polling.
-func (q *Reader) ConnectToLookupd(addr string) error {
+func (q *Reader) ConnectToNSQLookupd(addr string) error {
 	q.mtx.Lock()
 	for _, x := range q.lookupdHTTPAddrs {
 		if x == addr {
@@ -319,7 +319,7 @@ func (q *Reader) queryLookupd() {
 
 		// make an address, start a connection
 		joined := net.JoinHostPort(address, strconv.Itoa(port))
-		err = q.ConnectToNSQ(joined)
+		err = q.ConnectToNSQD(joined)
 		if err != nil && err != ErrAlreadyConnected {
 			q.log(LogLevelError, "(%s) error connecting to nsqd - %s", joined, err)
 			continue
@@ -327,12 +327,12 @@ func (q *Reader) queryLookupd() {
 	}
 }
 
-// ConnectToNSQ takes a nsqd address to connect directly to.
+// ConnectToNSQD takes a nsqd address to connect directly to.
 //
-// It is recommended to use ConnectToLookupd so that topics are discovered
+// It is recommended to use ConnectToNSQLookupd so that topics are discovered
 // automatically.  This method is useful when you want to connect to a single, local,
 // instance.
-func (q *Reader) ConnectToNSQ(addr string) error {
+func (q *Reader) ConnectToNSQD(addr string) error {
 	if atomic.LoadInt32(&q.stopFlag) == 1 {
 		return errors.New("reader stopped")
 	}
@@ -502,7 +502,7 @@ func (q *Reader) onConnClose(c *Conn) {
 				if atomic.LoadInt32(&q.stopFlag) == 1 {
 					break
 				}
-				err := q.ConnectToNSQ(addr)
+				err := q.ConnectToNSQD(addr)
 				if err != nil && err != ErrAlreadyConnected {
 					q.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
 					continue
