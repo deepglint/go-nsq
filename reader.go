@@ -446,7 +446,7 @@ func (q *Reader) onConnClose(c *Conn) {
 	q.rdyRetryMtx.Unlock()
 
 	q.mtx.Lock()
-	delete(q.connections, c.RemoteAddr().String())
+	delete(q.connections, c.String())
 	left := len(q.connections)
 	q.mtx.Unlock()
 
