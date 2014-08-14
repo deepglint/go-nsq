@@ -459,6 +459,10 @@ func (c *Conn) readLoop() {
 			goto exit
 		}
 
+		//
+		//log.Printf("===== Frame Type: %d", frameType)
+		//
+
 		if frameType == FrameTypeResponse && bytes.Equal(data, []byte("_heartbeat_")) {
 			c.log(LogLevelDebug, "heartbeat received")
 			c.delegate.OnHeartbeat(c)
