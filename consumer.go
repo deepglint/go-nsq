@@ -428,7 +428,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		return ErrAlreadyConnected
 	}
 
-	r.log(LogLevelInfo, "(%s) connecting to nsqd", addr)
+	//r.log(LogLevelInfo, "(%s) connecting to nsqd", addr)
 
 	conn := NewConn(addr, &r.config, &consumerConnDelegate{r})
 	conn.SetLogger(r.logger, r.logLvl,
