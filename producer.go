@@ -23,9 +23,9 @@ type Producer struct {
 	logger *log.Logger
 	logLvl LogLevel
 
-	responseChan  chan []byte
-	errorChan     chan []byte
-	closeChan     chan int
+	responseChan chan []byte
+	errorChan    chan []byte
+	closeChan    chan int
 
 	transactionChan chan *ProducerTransaction
 	transactions    []*ProducerTransaction
