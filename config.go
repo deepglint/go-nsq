@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
+	"math/rand"
+	"net"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -26,40 +30,113 @@ type defaultsHandler interface {
 	SetDefaults(c *Config) error
 }
 
+// BackoffStrategy defines a strategy for calculating the duration of time
+// a consumer should backoff for a given attempt
+type BackoffStrategy interface {
+	Calculate(attempt int) time.Duration
+}
+
+// ExponentialStrategy implements an exponential backoff strategy (default)
+type ExponentialStrategy struct {
+	cfg *Config
+}
+
+// Calculate returns a duration of time: 2 ^ attempt
+func (s *ExponentialStrategy) Calculate(attempt int) time.Duration {
+	backoffDuration := s.cfg.BackoffMultiplier *
+		time.Duration(math.Pow(2, float64(attempt)))
+	if backoffDuration > s.cfg.MaxBackoffDuration {
+		backoffDuration = s.cfg.MaxBackoffDuration
+	}
+	return backoffDuration
+}
+
+func (s *ExponentialStrategy) setConfig(cfg *Config) {
+	s.cfg = cfg
+}
+
+// FullJitterStrategy implements http://www.awsarchitectureblog.com/2015/03/backoff.html
+type FullJitterStrategy struct {
+	cfg *Config
+
+	rngOnce sync.Once
+	rng     *rand.Rand
+}
+
+// Calculate returns a random duration of time [0, 2 ^ attempt]
+func (s *FullJitterStrategy) Calculate(attempt int) time.Duration {
+	// lazily initialize the RNG
+	s.rngOnce.Do(func() {
+		if s.rng != nil {
+			return
+		}
+		s.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	})
+
+	backoffDuration := s.cfg.BackoffMultiplier *
+		time.Duration(math.Pow(2, float64(attempt)))
+	if backoffDuration > s.cfg.MaxBackoffDuration {
+		backoffDuration = s.cfg.MaxBackoffDuration
+	}
+	return time.Duration(s.rng.Intn(int(backoffDuration)))
+}
+
+func (s *FullJitterStrategy) setConfig(cfg *Config) {
+	s.cfg = cfg
+}
+
 // Config is a struct of NSQ options
 //
 // The only valid way to create a Config is via NewConfig, using a struct literal will panic.
 // After Config is passed into a high-level type (like Consumer, Producer, etc.) the values are no
 // longer mutable (they are copied).
 //
-// Use Set(key string, value interface{}) as an alternate way to set parameters
+// Use Set(option string, value interface{}) as an alternate way to set parameters
 type Config struct {
 	initialized bool
 
 	// used to Initialize, Validate
 	configHandlers []configHandler
 
+	DialTimeout time.Duration `opt:"dial_timeout" default:"1s"`
+
 	// Deadlines for network reads and writes
 	ReadTimeout  time.Duration `opt:"read_timeout" min:"100ms" max:"5m" default:"60s"`
 	WriteTimeout time.Duration `opt:"write_timeout" min:"100ms" max:"5m" default:"1s"`
 
+	// LocalAddr is the local address to use when dialing an nsqd.
+	// If empty, a local address is automatically chosen.
+	LocalAddr net.Addr `opt:"local_addr"`
+
 	// Duration between polling lookupd for new producers, and fractional jitter to add to
 	// the lookupd pool loop. this helps evenly distribute requests even if multiple consumers
 	// restart at the same time
-	LookupdPollInterval time.Duration `opt:"lookupd_poll_interval" min:"5s" max:"5m" default:"60s"`
+	//
+	// NOTE: when not using nsqlookupd, LookupdPollInterval represents the duration of time between
+	// reconnection attempts
+	LookupdPollInterval time.Duration `opt:"lookupd_poll_interval" min:"10ms" max:"5m" default:"60s"`
 	LookupdPollJitter   float64       `opt:"lookupd_poll_jitter" min:"0" max:"1" default:"0.3"`
 
 	// Maximum duration when REQueueing (for doubling of deferred requeue)
 	MaxRequeueDelay     time.Duration `opt:"max_requeue_delay" min:"0" max:"60m" default:"15m"`
 	DefaultRequeueDelay time.Duration `opt:"default_requeue_delay" min:"0" max:"60m" default:"90s"`
+
+	// Backoff strategy, defaults to exponential backoff. Overwrite this to define alternative backoff algrithms.
+	BackoffStrategy BackoffStrategy `opt:"backoff_strategy" default:"exponential"`
+	// Maximum amount of time to backoff when processing fails 0 == no backoff
+	MaxBackoffDuration time.Duration `opt:"max_backoff_duration" min:"0" max:"60m" default:"2m"`
 	// Unit of time for calculating consumer backoff
 	BackoffMultiplier time.Duration `opt:"backoff_multiplier" min:"0" max:"60m" default:"1s"`
 
 	// Maximum number of times this consumer will attempt to process a message before giving up
 	MaxAttempts uint16 `opt:"max_attempts" min:"0" max:"65535" default:"5"`
-	// Amount of time in seconds to wait for a message from a producer when in a state where RDY
+
+	// Duration to wait for a message from a producer when in a state where RDY
 	// counts are re-distributed (ie. max_in_flight < num_producers)
 	LowRdyIdleTimeout time.Duration `opt:"low_rdy_idle_timeout" min:"1s" max:"5m" default:"10s"`
+
+	// Duration between redistributing max-in-flight to connections
+	RDYRedistributeInterval time.Duration `opt:"rdy_redistribute_interval" min:"1ms" max:"5s" default:"5s"`
 
 	// Identifiers sent to nsqd representing this client
 	// UserAgent is in the spirit of HTTP (default: "<client_library_name>/<version>")
@@ -72,8 +149,15 @@ type Config struct {
 	// Integer percentage to sample the channel (requires nsqd 0.2.25+)
 	SampleRate int32 `opt:"sample_rate" min:"0" max:"99"`
 
-	// TLS Settings
-	// use tls-root-ca-file and tls-insecure-skip-verify to set tls config options
+	// To set TLS config, use the following options:
+	//
+	// tls_v1 - Bool enable TLS negotiation
+	// tls_root_ca_file - String path to file containing root CA
+	// tls_insecure_skip_verify - Bool indicates whether this client should verify server certificates
+	// tls_cert - String path to file containing public key for certificate
+	// tls_key - String path to file containing private key for certificate
+	// tls_min_version - String indicating the minimum version of tls acceptable ('ssl3.0', 'tls1.0', 'tls1.1', 'tls1.2')
+	//
 	TlsV1     bool        `opt:"tls_v1"`
 	TlsConfig *tls.Config `opt:"tls_config"`
 
@@ -94,9 +178,6 @@ type Config struct {
 	// Maximum number of messages to allow in flight (concurrency knob)
 	MaxInFlight int `opt:"max_in_flight" min:"0" default:"1"`
 
-	// Maximum amount of time to backoff when processing fails 0 == no backoff
-	MaxBackoffDuration time.Duration `opt:"max_backoff_duration" min:"0" max:"60m" default:"2m"`
-
 	// The server-side message timeout for messages delivered to this client
 	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"`
 
@@ -108,9 +189,10 @@ type Config struct {
 //
 // This must be used to initialize Config structs. Values can be set directly, or through Config.Set()
 func NewConfig() *Config {
-	c := &Config{}
-	c.configHandlers = append(c.configHandlers, &structTagsConfig{}, &tlsConfig{})
-	c.initialized = true
+	c := &Config{
+		configHandlers: []configHandler{&structTagsConfig{}, &tlsConfig{}},
+		initialized:    true,
+	}
 	if err := c.setDefaults(); err != nil {
 		panic(err.Error())
 	}
@@ -137,9 +219,8 @@ func NewConfig() *Config {
 //
 // It returns an error for an invalid option or value.
 func (c *Config) Set(option string, value interface{}) error {
-
 	c.assertInitialized()
-
+	option = strings.Replace(option, "-", "_", -1)
 	for _, h := range c.configHandlers {
 		if h.HandlesOption(c, option) {
 			return h.Set(c, option, value)
@@ -156,16 +237,13 @@ func (c *Config) assertInitialized() {
 
 // Validate checks that all values are within specified min/max ranges
 func (c *Config) Validate() error {
-
 	c.assertInitialized()
-
 	for _, h := range c.configHandlers {
 		if err := h.Validate(c); err != nil {
 			return err
 		}
 	}
 	return nil
-
 }
 
 func (c *Config) setDefaults() error {
@@ -177,12 +255,10 @@ func (c *Config) setDefaults() error {
 			}
 		}
 	}
-
 	return nil
 }
 
-type structTagsConfig struct {
-}
+type structTagsConfig struct{}
 
 // Handle options that are listed in StructTags
 func (h *structTagsConfig) HandlesOption(c *Config, option string) bool {
@@ -232,6 +308,14 @@ func (h *structTagsConfig) Set(c *Config, option string, value interface{}) erro
 			if valueCompare(coercedVal, coercedMaxVal) == 1 {
 				return fmt.Errorf("invalid %s ! %v > %v",
 					option, coercedVal.Interface(), coercedMaxVal.Interface())
+			}
+		}
+		if coercedVal.Type().String() == "nsq.BackoffStrategy" {
+			v := coercedVal.Interface().(BackoffStrategy)
+			if v, ok := v.(interface {
+				setConfig(*Config)
+			}); ok {
+				v.setConfig(c)
 			}
 		}
 		dest.Set(coercedVal)
@@ -301,43 +385,64 @@ func (h *structTagsConfig) Validate(c *Config) error {
 	if c.HeartbeatInterval > c.ReadTimeout {
 		return fmt.Errorf("HeartbeatInterval %v must be less than ReadTimeout %v", c.HeartbeatInterval, c.ReadTimeout)
 	}
+
 	return nil
 }
 
 // Parsing for higher order TLS settings
 type tlsConfig struct {
+	certFile string
+	keyFile  string
 }
 
 func (t *tlsConfig) HandlesOption(c *Config, option string) bool {
 	switch option {
-	case "tls-root-ca-file", "tls-insecure-skip-verify":
+	case "tls_root_ca_file", "tls_insecure_skip_verify", "tls_cert", "tls_key", "tls_min_version":
 		return true
 	}
 	return false
 }
+
 func (t *tlsConfig) Set(c *Config, option string, value interface{}) error {
 	if c.TlsConfig == nil {
-		c.TlsConfig = &tls.Config{}
+		c.TlsConfig = &tls.Config{
+			MinVersion: tls.VersionTLS10,
+			MaxVersion: tls.VersionTLS12, // enable TLS_FALLBACK_SCSV prior to Go 1.5: https://go-review.googlesource.com/#/c/1776/
+		}
 	}
 	val := reflect.ValueOf(c.TlsConfig).Elem()
 
 	switch option {
-	case "tls-root-ca-file":
+	case "tls_cert", "tls_key":
+		if option == "tls_cert" {
+			t.certFile = value.(string)
+		} else {
+			t.keyFile = value.(string)
+		}
+		if t.certFile != "" && t.keyFile != "" && len(c.TlsConfig.Certificates) == 0 {
+			cert, err := tls.LoadX509KeyPair(t.certFile, t.keyFile)
+			if err != nil {
+				return err
+			}
+			c.TlsConfig.Certificates = []tls.Certificate{cert}
+		}
+		return nil
+	case "tls_root_ca_file":
 		filename, ok := value.(string)
 		if !ok {
 			return fmt.Errorf("ERROR: %v is not a string", value)
 		}
 		tlsCertPool := x509.NewCertPool()
-		ca_cert_file, err := ioutil.ReadFile(filename)
+		caCertFile, err := ioutil.ReadFile(filename)
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to read custom Certificate Authority file %s", err)
 		}
-		if !tlsCertPool.AppendCertsFromPEM(ca_cert_file) {
+		if !tlsCertPool.AppendCertsFromPEM(caCertFile) {
 			return fmt.Errorf("ERROR: failed to append certificates from Certificate Authority file")
 		}
-		c.TlsConfig.ClientCAs = tlsCertPool
+		c.TlsConfig.RootCAs = tlsCertPool
 		return nil
-	case "tls-insecure-skip-verify":
+	case "tls_insecure_skip_verify":
 		fieldVal := val.FieldByName("InsecureSkipVerify")
 		dest := unsafeValueOf(fieldVal)
 		coercedVal, err := coerce(value, fieldVal.Type())
@@ -347,9 +452,29 @@ func (t *tlsConfig) Set(c *Config, option string, value interface{}) error {
 		}
 		dest.Set(coercedVal)
 		return nil
+	case "tls_min_version":
+		version, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("ERROR: %v is not a string", value)
+		}
+		switch version {
+		case "ssl3.0":
+			c.TlsConfig.MinVersion = tls.VersionSSL30
+		case "tls1.0":
+			c.TlsConfig.MinVersion = tls.VersionTLS10
+		case "tls1.1":
+			c.TlsConfig.MinVersion = tls.VersionTLS11
+		case "tls1.2":
+			c.TlsConfig.MinVersion = tls.VersionTLS12
+		default:
+			return fmt.Errorf("ERROR: %v is not a tls version", value)
+		}
+		return nil
 	}
+
 	return fmt.Errorf("unknown option %s", option)
 }
+
 func (t *tlsConfig) Validate(c *Config) error {
 	return nil
 }
@@ -413,9 +538,13 @@ func coerce(v interface{}, typ reflect.Type) (reflect.Value, error) {
 		v, err = coerceBool(v)
 	case "time.Duration":
 		v, err = coerceDuration(v)
+	case "net.Addr":
+		v, err = coerceAddr(v)
+	case "nsq.BackoffStrategy":
+		v, err = coerceBackoffStrategy(v)
 	default:
 		v = nil
-		err = errors.New(fmt.Sprintf("invalid type %s", typ.String()))
+		err = fmt.Errorf("invalid type %s", typ.String())
 	}
 	return valueTypeCoerce(v, typ), err
 }
@@ -433,28 +562,28 @@ func valueTypeCoerce(v interface{}, typ reflect.Type) reflect.Value {
 		tval.SetUint(val.Uint())
 	case "float32", "float64":
 		tval.SetFloat(val.Float())
+	default:
+		tval.Set(val)
 	}
 	return tval
 }
 
 func coerceString(v interface{}) (string, error) {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string:
-		return v.(string), nil
+		return v, nil
 	case int, int16, int32, int64, uint, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", v), nil
-	case float64:
+	case float32, float64:
 		return fmt.Sprintf("%f", v), nil
-	default:
-		return fmt.Sprintf("%s", v), nil
 	}
-	return "", errors.New("invalid value type")
+	return fmt.Sprintf("%s", v), nil
 }
 
 func coerceDuration(v interface{}) (time.Duration, error) {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string:
-		return time.ParseDuration(v.(string))
+		return time.ParseDuration(v)
 	case int, int16, int32, int64:
 		// treat like ms
 		return time.Duration(reflect.ValueOf(v).Int()) * time.Millisecond, nil
@@ -462,17 +591,42 @@ func coerceDuration(v interface{}) (time.Duration, error) {
 		// treat like ms
 		return time.Duration(reflect.ValueOf(v).Uint()) * time.Millisecond, nil
 	case time.Duration:
-		return v.(time.Duration), nil
+		return v, nil
 	}
 	return 0, errors.New("invalid value type")
 }
 
-func coerceBool(v interface{}) (bool, error) {
-	switch v.(type) {
-	case bool:
-		return v.(bool), nil
+func coerceAddr(v interface{}) (net.Addr, error) {
+	switch v := v.(type) {
 	case string:
-		return strconv.ParseBool(v.(string))
+		return net.ResolveTCPAddr("tcp", v)
+	case net.Addr:
+		return v, nil
+	}
+	return nil, errors.New("invalid value type")
+}
+
+func coerceBackoffStrategy(v interface{}) (BackoffStrategy, error) {
+	switch v := v.(type) {
+	case string:
+		switch v {
+		case "", "exponential":
+			return &ExponentialStrategy{}, nil
+		case "full_jitter":
+			return &FullJitterStrategy{}, nil
+		}
+	case BackoffStrategy:
+		return v, nil
+	}
+	return nil, errors.New("invalid value type")
+}
+
+func coerceBool(v interface{}) (bool, error) {
+	switch v := v.(type) {
+	case bool:
+		return v, nil
+	case string:
+		return strconv.ParseBool(v)
 	case int, int16, int32, int64:
 		return reflect.ValueOf(v).Int() != 0, nil
 	case uint, uint16, uint32, uint64:
@@ -482,23 +636,25 @@ func coerceBool(v interface{}) (bool, error) {
 }
 
 func coerceFloat64(v interface{}) (float64, error) {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string:
-		return strconv.ParseFloat(v.(string), 64)
+		return strconv.ParseFloat(v, 64)
 	case int, int16, int32, int64:
 		return float64(reflect.ValueOf(v).Int()), nil
 	case uint, uint16, uint32, uint64:
 		return float64(reflect.ValueOf(v).Uint()), nil
+	case float32:
+		return float64(v), nil
 	case float64:
-		return v.(float64), nil
+		return v, nil
 	}
 	return 0, errors.New("invalid value type")
 }
 
 func coerceInt64(v interface{}) (int64, error) {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string:
-		return strconv.ParseInt(v.(string), 10, 64)
+		return strconv.ParseInt(v, 10, 64)
 	case int, int16, int32, int64:
 		return reflect.ValueOf(v).Int(), nil
 	case uint, uint16, uint32, uint64:
@@ -508,9 +664,9 @@ func coerceInt64(v interface{}) (int64, error) {
 }
 
 func coerceUint64(v interface{}) (uint64, error) {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string:
-		return strconv.ParseUint(v.(string), 10, 64)
+		return strconv.ParseUint(v, 10, 64)
 	case int, int16, int32, int64:
 		return uint64(reflect.ValueOf(v).Int()), nil
 	case uint, uint16, uint32, uint64:

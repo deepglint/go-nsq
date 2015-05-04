@@ -2,16 +2,33 @@ package nsq
 
 import "time"
 
+type logger interface {
+	Output(calldepth int, s string) error
+}
+
 // LogLevel specifies the severity of a given log message
 type LogLevel int
 
-// logging levels
+// Log levels
 const (
 	LogLevelDebug LogLevel = iota
 	LogLevelInfo
 	LogLevelWarning
 	LogLevelError
 )
+
+// String returns the string form for a given LogLevel
+func (lvl LogLevel) String() string {
+	switch lvl {
+	case LogLevelInfo:
+		return "INF"
+	case LogLevelWarning:
+		return "WRN"
+	case LogLevelError:
+		return "ERR"
+	}
+	return "DBG"
+}
 
 // MessageDelegate is an interface of methods that are used as
 // callbacks in Message
@@ -65,6 +82,9 @@ type ConnDelegate interface {
 	// OnBackoff is called when the connection triggers a backoff state
 	OnBackoff(*Conn)
 
+	// OnContinue is called when the connection finishes a message without adjusting backoff state
+	OnContinue(*Conn)
+
 	// OnResume is called when the connection triggers a resume state
 	OnResume(*Conn)
 
@@ -93,6 +113,7 @@ func (d *consumerConnDelegate) OnMessage(c *Conn, m *Message)         { d.r.onCo
 func (d *consumerConnDelegate) OnMessageFinished(c *Conn, m *Message) { d.r.onConnMessageFinished(c, m) }
 func (d *consumerConnDelegate) OnMessageRequeued(c *Conn, m *Message) { d.r.onConnMessageRequeued(c, m) }
 func (d *consumerConnDelegate) OnBackoff(c *Conn)                     { d.r.onConnBackoff(c) }
+func (d *consumerConnDelegate) OnContinue(c *Conn)                    { d.r.onConnContinue(c) }
 func (d *consumerConnDelegate) OnResume(c *Conn)                      { d.r.onConnResume(c) }
 func (d *consumerConnDelegate) OnIOError(c *Conn, err error)          { d.r.onConnIOError(c, err) }
 func (d *consumerConnDelegate) OnHeartbeat(c *Conn)                   { d.r.onConnHeartbeat(c) }
@@ -110,6 +131,7 @@ func (d *producerConnDelegate) OnMessage(c *Conn, m *Message)         {}
 func (d *producerConnDelegate) OnMessageFinished(c *Conn, m *Message) {}
 func (d *producerConnDelegate) OnMessageRequeued(c *Conn, m *Message) {}
 func (d *producerConnDelegate) OnBackoff(c *Conn)                     {}
+func (d *producerConnDelegate) OnContinue(c *Conn)                    {}
 func (d *producerConnDelegate) OnResume(c *Conn)                      {}
 func (d *producerConnDelegate) OnIOError(c *Conn, err error)          { d.w.onConnIOError(c, err) }
 func (d *producerConnDelegate) OnHeartbeat(c *Conn)                   { d.w.onConnHeartbeat(c) }

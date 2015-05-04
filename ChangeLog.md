@@ -1,19 +1,70 @@
 ## go-nsq Change Log
 
-### 1.0.0-alpha
+### 1.0.4 - 2015-04-07
 
-**Upgrading from 0.3.7**: The public API was refactored considerably and is not backwards
+**Upgrading from 1.0.3**: There are no backward incompatible changes.
+
+ * #133 - fix `ErrNotConnected` race during `Producer` connection (thanks @jeddenlea)
+ * #132 - fix `RDY` redistribution after backoff with no connections
+ * #128 - fix backoff stall when using `RequeueWithoutBackoff`
+ * #127 - fix handling of connection closing when resuming after backoff (thanks @jnewmano)
+ * #126 - allow `BackoffStrategy` to be set via flag (thanks @twmb)
+ * #125 - add pluggable consumer `BackoffStrategy`; add full-jitter strategy (thanks @hden)
+ * #124 - add `DialTimeout` and `LocalAddr` config (thanks @yashkin)
+ * #119 - add `Producer.Ping()` method (thanks @zulily)
+ * #122 - refactor log level string handling
+ * #120 - fix `Message` data races on `responded`
+ * #114 - fix lookupd jitter having no effect (thanks @judwhite)
+
+### 1.0.3 - 2015-02-07
+
+**Upgrading from 1.0.2**: There are no backward incompatible changes.
+
+ * #104 - fix reconnect address bug (thanks @ryanslade)
+ * #106 - fix backoff reconnect deadlock (thanks @ryanslade)
+ * #107 - fix out-of-bounds error when removing nsqlookupd addresses (thanks @andreas)
+ * #108 - fix potential logger race conditions (thanks @judwhite)
+ * #111 - fix resolved address error in reconnect loop (thanks @twmb)
+
+### 1.0.2 - 2015-01-21
+
+**Upgrading from 1.0.1**: There are no backward incompatible changes.
+
+ * #102 - TLS min/max config defaults (thanks @twmb)
+ * #99 - fix `Consumer.Stop()` race and `Producer.Stop()` deadlock (thanks @tylertreat)
+ * #92 - expose `Message.NSQDAddress`
+ * #95 - cleanup panic during `Consumer.Stop()` if handlers are deadlocked
+ * #98 - add `tls-min-version` option (thanks @twmb)
+ * #93 - expose a way to get `Consumer` runtime stats (thanks @dcarney)
+ * #94 - allow `#ephemeral` topic names (thanks @jamesgroat)
+
+### 1.0.1 - 2014-11-09
+
+**Upgrading from 1.0.0**: There are no backward incompatible changes functionally, however this
+release no longer compiles with Go `1.0.x`.
+
+ * #89 - don't spam connection teardown cleanup messages
+ * #91 - add consumer `DisconnectFrom*`
+ * #87 - allow `heartbeat_interval` and `output_buffer_timeout` to be disabled
+ * #86 - pluggable `nsqlookupd` behaviors
+ * #83 - send `RDY` before `FIN`/`REQ` (forwards compatibility with bitly/nsq#404)
+ * #82 - fix panic when conn isn't assigned
+ * #75/#76 - minor config related bug fixes
+ * #75/#77/#78 - add `tls-cert` and `tls-key` config options
+
+### 1.0.0 - 2014-08-11
+
+**Upgrading from 0.3.7**: The public API was significantly refactored and is not backwards
 compatible, please read [UPGRADING](UPGRADING.md).
 
- * #58 - support IDENTIFY `msg_timeout`
- * #54 - per-connection TLS config and set ServerName
- * #45 - fix producer connect/close race
+ * #58 - support `IDENTIFY` `msg_timeout`
+ * #54 - per-connection TLS config and set `ServerName`
  * #49 - add common connect helpers
- * #43 - more flexible nsqlookupd URL specification
- * #35 - AUTH support
- * #41 - use package private RNG
- * #36 - support 64char topic/channel names
- * #30/#38/#39/#42/#46/#48/#51/#52 - refactor public API (see [UPGRADING](UPGRADING.md))
+ * #43/#63 - more flexible `nsqlookupd` URL specification
+ * #35 - `AUTH` support
+ * #41/#62 - use package private RNG
+ * #36 - support 64 character topic/channel names
+ * #30/#38/#39/#42/#45/#46/#48/#51/#52/#65/#70 - refactor public API (see [UPGRADING](UPGRADING.md))
 
 ### 0.3.7 - 2014-05-25
 

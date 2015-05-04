@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -66,15 +65,13 @@ type Conn struct {
 
 	delegate ConnDelegate
 
-	logger *log.Logger
-	logLvl LogLevel
-	logFmt string
+	logger   logger
+	logLvl   LogLevel
+	logFmt   string
+	logGuard sync.RWMutex
 
 	r io.Reader
 	w io.Writer
-
-	backoffCounter int32
-	rdyRetryTimer  *time.Timer
 
 	cmdChan         chan *Command
 	msgResponseChan chan *msgResponse
@@ -115,8 +112,17 @@ func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
 // a single %s argument.  This is useful if you want to provide additional
 // context to the log messages that the connection will print, the default
 // is '(%s)'.
-func (c *Conn) SetLogger(logger *log.Logger, lvl LogLevel, format string) {
-	c.logger = logger
+//
+// The logger parameter is an interface that requires the following
+// method to be implemented (such as the the stdlib log.Logger):
+//
+//    Output(calldepth int, s string)
+//
+func (c *Conn) SetLogger(l logger, lvl LogLevel, format string) {
+	c.logGuard.Lock()
+	defer c.logGuard.Unlock()
+
+	c.logger = l
 	c.logLvl = lvl
 	c.logFmt = format
 	if c.logFmt == "" {
@@ -124,10 +130,22 @@ func (c *Conn) SetLogger(logger *log.Logger, lvl LogLevel, format string) {
 	}
 }
 
+func (c *Conn) getLogger() (logger, LogLevel, string) {
+	c.logGuard.RLock()
+	defer c.logGuard.RUnlock()
+
+	return c.logger, c.logLvl, c.logFmt
+}
+
 // Connect dials and bootstraps the nsqd connection
 // (including IDENTIFY) and returns the IdentifyResponse
 func (c *Conn) Connect() (*IdentifyResponse, error) {
-	conn, err := net.DialTimeout("tcp", c.addr, time.Second)
+	dialer := &net.Dialer{
+		LocalAddr: c.config.LocalAddr,
+		Timeout:   c.config.DialTimeout,
+	}
+
+	conn, err := dialer.Dial("tcp", c.addr)
 	if err != nil {
 		return nil, err
 	}
@@ -275,10 +293,18 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 	ci["deflate_level"] = c.config.DeflateLevel
 	ci["snappy"] = c.config.Snappy
 	ci["feature_negotiation"] = true
-	ci["heartbeat_interval"] = int64(c.config.HeartbeatInterval / time.Millisecond)
+	if c.config.HeartbeatInterval == -1 {
+		ci["heartbeat_interval"] = -1
+	} else {
+		ci["heartbeat_interval"] = int64(c.config.HeartbeatInterval / time.Millisecond)
+	}
 	ci["sample_rate"] = c.config.SampleRate
 	ci["output_buffer_size"] = c.config.OutputBufferSize
-	ci["output_buffer_timeout"] = int64(c.config.OutputBufferTimeout / time.Millisecond)
+	if c.config.OutputBufferTimeout == -1 {
+		ci["output_buffer_timeout"] = -1
+	} else {
+		ci["output_buffer_timeout"] = int64(c.config.OutputBufferTimeout / time.Millisecond)
+	}
 	ci["msg_timeout"] = int64(c.config.MsgTimeout / time.Millisecond)
 	cmd, err := Identify(ci)
 	if err != nil {
@@ -439,12 +465,14 @@ func (c *Conn) auth(secret string) error {
 		return err
 	}
 
-	c.log(LogLevelInfo, "Auth accepted. Identity: %q %s Permissions: %d", resp.Identity, resp.IdentityUrl, resp.PermissionCount)
+	c.log(LogLevelInfo, "Auth accepted. Identity: %q %s Permissions: %d",
+		resp.Identity, resp.IdentityUrl, resp.PermissionCount)
 
 	return nil
 }
 
 func (c *Conn) readLoop() {
+	delegate := &connMessageDelegate{c}
 	for {
 		if atomic.LoadInt32(&c.closeFlag) == 1 {
 			goto exit
@@ -481,7 +509,8 @@ func (c *Conn) readLoop() {
 				c.delegate.OnIOError(c, err)
 				goto exit
 			}
-			msg.Delegate = &connMessageDelegate{c}
+			msg.Delegate = delegate
+			msg.NSQDAddress = c.String()
 
 			atomic.AddInt64(&c.rdyCount, -1)
 			atomic.AddInt64(&c.messagesInFlight, 1)
@@ -532,25 +561,25 @@ func (c *Conn) writeLoop() {
 			// Decrement this here so it is correct even if we can't respond to nsqd
 			msgsInFlight := atomic.AddInt64(&c.messagesInFlight, -1)
 
-			err := c.WriteCommand(resp.cmd)
-			if err != nil {
-				c.log(LogLevelError, "error sending command %s - %s", resp.cmd, err)
-				c.close()
-				continue
-			}
-
 			if resp.success {
 				c.log(LogLevelDebug, "FIN %s", resp.msg.ID)
 				c.delegate.OnMessageFinished(c, resp.msg)
-				if resp.backoff {
-					c.delegate.OnResume(c)
-				}
+				c.delegate.OnResume(c)
 			} else {
 				c.log(LogLevelDebug, "REQ %s", resp.msg.ID)
 				c.delegate.OnMessageRequeued(c, resp.msg)
 				if resp.backoff {
 					c.delegate.OnBackoff(c)
+				} else {
+					c.delegate.OnContinue(c)
 				}
+			}
+
+			err := c.WriteCommand(resp.cmd)
+			if err != nil {
+				c.log(LogLevelError, "error sending command %s - %s", resp.cmd, err)
+				c.close()
+				continue
 			}
 
 			if msgsInFlight == 0 &&
@@ -607,6 +636,7 @@ func (c *Conn) close() {
 func (c *Conn) cleanup() {
 	<-c.drainReady
 	ticker := time.NewTicker(100 * time.Millisecond)
+	lastWarning := time.Now()
 	// writeLoop has exited, drain any remaining in flight messages
 	for {
 		// we're racing with readLoop which potentially has a message
@@ -620,13 +650,19 @@ func (c *Conn) cleanup() {
 			msgsInFlight = atomic.LoadInt64(&c.messagesInFlight)
 		}
 		if msgsInFlight > 0 {
-			c.log(LogLevelWarning, "draining... waiting for %d messages in flight", msgsInFlight)
+			if time.Now().Sub(lastWarning) > time.Second {
+				c.log(LogLevelWarning, "draining... waiting for %d messages in flight", msgsInFlight)
+				lastWarning = time.Now()
+			}
 			continue
 		}
 		// until the readLoop has exited we cannot be sure that there
 		// still won't be a race
 		if atomic.LoadInt32(&c.readLoopRunning) == 1 {
-			c.log(LogLevelWarning, "draining... readLoop still running")
+			if time.Now().Sub(lastWarning) > time.Second {
+				c.log(LogLevelWarning, "draining... readLoop still running")
+				lastWarning = time.Now()
+			}
 			continue
 		}
 		goto exit
@@ -648,7 +684,7 @@ func (c *Conn) waitForCleanup() {
 }
 
 func (c *Conn) onMessageFinish(m *Message) {
-	c.msgResponseChan <- &msgResponse{m, Finish(m.ID), true, true}
+	c.msgResponseChan <- &msgResponse{msg: m, cmd: Finish(m.ID), success: true}
 }
 
 func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
@@ -660,7 +696,7 @@ func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
 			delay = c.config.MaxRequeueDelay
 		}
 	}
-	c.msgResponseChan <- &msgResponse{m, Requeue(m.ID, delay), false, backoff}
+	c.msgResponseChan <- &msgResponse{msg: m, cmd: Requeue(m.ID, delay), success: false, backoff: backoff}
 }
 
 func (c *Conn) onMessageTouch(m *Message) {
@@ -671,28 +707,17 @@ func (c *Conn) onMessageTouch(m *Message) {
 }
 
 func (c *Conn) log(lvl LogLevel, line string, args ...interface{}) {
-	var prefix string
+	logger, logLvl, logFmt := c.getLogger()
 
-	if c.logger == nil {
+	if logger == nil {
 		return
 	}
 
-	if c.logLvl > lvl {
+	if logLvl > lvl {
 		return
 	}
 
-	switch lvl {
-	case LogLevelDebug:
-		prefix = "DBG"
-	case LogLevelInfo:
-		prefix = "INF"
-	case LogLevelWarning:
-		prefix = "WRN"
-	case LogLevelError:
-		prefix = "ERR"
-	}
-
-	c.logger.Printf("%-4s %s %s", prefix,
-		fmt.Sprintf(c.logFmt, c.String()),
-		fmt.Sprintf(line, args...))
+	logger.Output(2, fmt.Sprintf("%-4s %s %s", lvl,
+		fmt.Sprintf(logFmt, c.String()),
+		fmt.Sprintf(line, args...)))
 }
