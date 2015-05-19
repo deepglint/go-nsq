@@ -734,16 +734,16 @@ func (r *Consumer) onConnClose(c *Conn) {
 			for {
 				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr, r.config.LookupdPollInterval)
 				time.Sleep(r.config.LookupdPollInterval)
-				if atomic.LoadInt32(&r.stopFlag) == 1 {
-					break
-				}
-				r.mtx.RLock()
-				reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
-				r.mtx.RUnlock()
-				if !reconnect {
-					r.log(LogLevelWarning, "(%s) skipped reconnect after removal...", addr)
-					return
-				}
+				// if atomic.LoadInt32(&r.stopFlag) == 1 {
+				// 	break
+				// }
+				// r.mtx.RLock()
+				// reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
+				// r.mtx.RUnlock()
+				// if !reconnect {
+				// 	r.log(LogLevelWarning, "(%s) skipped reconnect after removal...", addr)
+				// 	return
+				// }
 				err := r.ConnectToNSQD(addr)
 				if err != nil && err != ErrAlreadyConnected {
 					r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
