@@ -3,6 +3,7 @@ package nsq
 import (
 	"encoding/binary"
 	"errors"
+	"github.com/RobitYadda/nsq/parser"
 	"io"
 	"regexp"
 )
@@ -20,7 +21,7 @@ const (
 	FrameTypeMessage  int32 = 2
 )
 
-var validTopicChannelNameRegex = regexp.MustCompile(`^[\.a-zA-Z0-9_-]+(#ephemeral)?$`)
+var validTopicChannelNameRegex = regexp.MustCompile(`^[\.a-zA-Z0-9_-]+(#ephemeral)?(#[\w#@]*)?$`)
 
 // IsValidTopicName checks a topic name for correctness
 func IsValidTopicName(name string) bool {
@@ -33,6 +34,12 @@ func IsValidChannelName(name string) bool {
 }
 
 func isValidName(name string) bool {
+	realName := parser.GetRealName(name)
+	if !parser.IsValidName(name) {
+		return false
+	}
+	name = realName
+	//fmt.Println(name)
 	if len(name) > 64 || len(name) < 1 {
 		return false
 	}
