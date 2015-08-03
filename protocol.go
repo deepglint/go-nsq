@@ -3,7 +3,7 @@ package nsq
 import (
 	"encoding/binary"
 	"errors"
-	"github.com/RobitYadda/nsq/parser"
+	"github.com/deepglint/nsq/parser"
 	"io"
 	"regexp"
 )
